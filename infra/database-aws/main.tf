@@ -7,8 +7,8 @@ data "aws_availability_zones" "available" {
 }
 
 resource "random_password" "db_password" {
-  length  = 32
-  special = true
+  length           = 32
+  special          = true
   override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
@@ -155,7 +155,6 @@ resource "aws_security_group" "rds" {
   }
 
   egress {
-    description = "Allow all outbound traffic"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -244,39 +243,31 @@ resource "aws_kms_alias" "rds" {
 }
 
 resource "aws_db_instance" "axialy" {
-  identifier     = var.db_identifier
-  engine         = "mysql"
-  engine_version = "8.0.35"
-
-  instance_class    = var.instance_class
-  allocated_storage = var.allocated_storage
-  storage_type      = "gp3"
-  storage_encrypted = true
-  kms_key_id        = aws_kms_key.rds.arn
-
-  db_name  = "axialy"
-  username = var.admin_default_user
-  password = random_password.db_password.result
-
+  identifier             = var.db_identifier
+  engine                 = "mysql"
+  engine_version         = "8.0.35"
+  instance_class         = var.instance_class
+  allocated_storage      = var.allocated_storage
+  storage_type           = "gp3"
+  storage_encrypted      = true
+  kms_key_id             = aws_kms_key.rds.arn
+  db_name                = "axialy"
+  username               = var.admin_default_user
+  password               = random_password.db_password.result
   vpc_security_group_ids = [aws_security_group.rds.id]
   db_subnet_group_name   = aws_db_subnet_group.axialy.name
   parameter_group_name   = aws_db_parameter_group.axialy.name
-
   multi_az               = var.multi_az
   publicly_accessible    = false
   backup_retention_period = var.backup_retention_period
   backup_window          = var.backup_window
   maintenance_window     = var.maintenance_window
-
   enabled_cloudwatch_logs_exports = ["error", "general", "slowquery"]
-  
-  deletion_protection = true
-  skip_final_snapshot = false
+  deletion_protection    = true
+  skip_final_snapshot    = false
   final_snapshot_identifier = "${var.db_identifier}-final-snapshot-${formatdate("YYYY-MM-DD-hhmm", timestamp())}"
-
   auto_minor_version_upgrade = true
   apply_immediately          = false
-
   performance_insights_enabled = true
   performance_insights_retention_period = 7
 
@@ -383,12 +374,12 @@ resource "aws_cloudwatch_log_group" "rds_slowquery" {
 resource "aws_cloudwatch_metric_alarm" "database_cpu" {
   alarm_name          = "axialy-database-high-cpu"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = "2"
+  evaluation_periods  = 2
   metric_name         = "CPUUtilization"
   namespace           = "AWS/RDS"
-  period              = "300"
+  period              = 300
   statistic           = "Average"
-  threshold           = "80"
+  threshold           = 80
   alarm_description   = "This metric monitors database CPU utilization"
   treat_missing_data  = "notBreaching"
 
@@ -407,12 +398,12 @@ resource "aws_cloudwatch_metric_alarm" "database_cpu" {
 resource "aws_cloudwatch_metric_alarm" "database_storage" {
   alarm_name          = "axialy-database-low-storage"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = "1"
+  evaluation_periods  = 1
   metric_name         = "FreeStorageSpace"
   namespace           = "AWS/RDS"
-  period              = "300"
+  period              = 300
   statistic           = "Average"
-  threshold           = "2147483648"
+  threshold           = 2147483648
   alarm_description   = "This metric monitors database free storage space"
   treat_missing_data  = "notBreaching"
 
