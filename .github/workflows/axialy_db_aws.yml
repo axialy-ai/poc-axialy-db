@@ -1,3 +1,4 @@
+# ── .github/workflows/axialy_db_aws.yml ───────────────────────────────────────
 name: Axialy DB AWS
 
 on:
@@ -86,14 +87,42 @@ jobs:
           echo "tf_lock_tbl=$LOCK_TABLE"    >> "$GITHUB_OUTPUT"
 
       # ── Deep hygiene: VPC quota + orphan resources + alias cleanup ─
-      - name: Deep cleanup (orphan VPCs, NAT EIPs, KMS alias)
+      - name: Deep cleanup (orphan VPCs, NAT EIPs, ENIs, endpoints, KMS alias)
         shell: bash
         env:
           AWS_PAGER: ""
         run: |
           set -euo pipefail
 
-          # 1) Remove stray KMS alias ───────────────────────────────
+          ######################################################################
+          # 0) Top‑level quota sanity – make sure we have head‑room for a fresh
+          #    VPC.  If we are at (or above) the regional 5‑VPC soft limit,
+          #    *try* to request a bump and then keep going with the cleanup so
+          #    we still end up under the existing quota.
+          ######################################################################
+          echo "🔎 Checking regional VPC quota utilisation …"
+          SERVICE_CODE="vpc"
+          QUOTA_CODE="L-F678F1CE"   # "VPCs per Region"
+          CUR_VPCS=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          CUR_LIMIT=$(aws service-quotas get-service-quota \
+                         --service-code "$SERVICE_CODE" \
+                         --quota-code   "$QUOTA_CODE" \
+                         --query 'Quota.Value' --output text)
+
+          echo "• Current usage: ${CUR_VPCS}/${CUR_LIMIT}"
+          if [ "$CUR_VPCS" -ge "$CUR_LIMIT" ]; then
+            DESIRED=$(( CUR_LIMIT + 5 ))
+            echo "⚠️  VPC quota maxed‑out – requesting temporary raise to ${DESIRED}"
+            aws service-quotas request-service-quota-increase \
+                 --service-code "$SERVICE_CODE" \
+                 --quota-code   "$QUOTA_CODE" \
+                 --desired-value "$DESIRED" 2>/dev/null || true
+          fi
+
+          ######################################################################
+          # 1) Remove stale KMS alias – must happen *before* Terraform tries
+          #    to create the same alias again.
+          ######################################################################
           if aws kms list-aliases \
                --query 'Aliases[?AliasName==`alias/axialy-rds`]' \
                --output text | grep -q 'alias/axialy-rds'; then
@@ -101,48 +130,73 @@ jobs:
             aws kms delete-alias --alias-name alias/axialy-rds
           fi
 
-          # 2) Nuke any Axialy‑tagged VPCs completely ───────────────
+          ######################################################################
+          # 2) Purge every VPC that carries an Axialy tag.  We tighten things
+          #    up by:
+          #      • Deleting *all* descendant resources (NAT GWs, Endpoints,
+          #        ENIs, NACLs, etc.)
+          #      • Waiting/polling after every destructive call to avoid the
+          #        “… in use …” dependency errors that left stragglers behind.
+          ######################################################################
           orphan_vpcs=$(aws ec2 describe-vpcs \
                        --filters "Name=tag:Name,Values=axialy-*" \
                        --query 'Vpcs[].VpcId' --output text || true)
 
           for vpc in $orphan_vpcs; do
-            echo "::group::Full purge of $vpc"
+            echo "::group::🧹 Full purge of $vpc"
 
-            # ── NAT Gateways & their EIPs ──────────────────────────
+            # ── 2.1 NAT Gateways & their EIPs ───────────────────────
             for ngw in $(aws ec2 describe-nat-gateways \
                            --filter Name=vpc-id,Values=$vpc \
                            --query 'NatGateways[].NatGatewayId' \
                            --output text || true); do
-              echo "Deleting NAT Gateway $ngw"
+              echo "• Deleting NAT Gateway $ngw"
               alloc=$(aws ec2 describe-nat-gateways --nat-gateway-ids "$ngw" \
                        --query 'NatGateways[0].NatGatewayAddresses[0].AllocationId' \
                        --output text || true)
               aws ec2 delete-nat-gateway --nat-gateway-id "$ngw" || true
 
-              # Wait (max 5 min) for the NAT GW to reach “deleted”
-              for _ in {1..60}; do
+              # Wait (max 5 min) for the NAT GW to disappear
+              for i in {1..60}; do
                 state=$(aws ec2 describe-nat-gateways --nat-gateway-ids "$ngw" \
                          --query 'NatGateways[0].State' --output text 2>/dev/null || true)
                 [[ "$state" == "deleted" || "$state" == "None" ]] && break
                 sleep 5
               done
 
-              # Release its EIP
               [ -n "$alloc" ] && aws ec2 release-address --allocation-id "$alloc" || true
             done
 
-            # ── Detach & delete IGWs ───────────────────────────────
+            # ── 2.2 VPC endpoints ──────────────────────────────────
+            for vpce in $(aws ec2 describe-vpc-endpoints \
+                            --filters Name=vpc-id,Values=$vpc \
+                            --query 'VpcEndpoints[].VpcEndpointId' \
+                            --output text || true); do
+              echo "• Deleting VPC Endpoint $vpce"
+              aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "$vpce" || true
+            done
+
+            # ── 2.3 Detach & delete IGWs ───────────────────────────
             for igw in $(aws ec2 describe-internet-gateways \
                            --filters Name=attachment.vpc-id,Values=$vpc \
                            --query 'InternetGateways[].InternetGatewayId' \
                            --output text || true); do
+              echo "• Deleting IGW $igw"
               aws ec2 detach-internet-gateway --internet-gateway-id "$igw" \
                                               --vpc-id "$vpc" || true
               aws ec2 delete-internet-gateway  --internet-gateway-id "$igw" || true
             done
 
-            # ── Route‑table associations (& tables) ────────────────
+            # ── 2.4 Custom NACLs ───────────────────────────────────
+            for nacl in $(aws ec2 describe-network-acls \
+                            --filters Name=vpc-id,Values=$vpc \
+                            --query 'NetworkAcls[?IsDefault==`false`].NetworkAclId' \
+                            --output text || true); do
+              echo "• Deleting NACL $nacl"
+              aws ec2 delete-network-acl --network-acl-id "$nacl" || true
+            done
+
+            # ── 2.5 Subnet Route‑table associations (& tables) ────
             for rta in $(aws ec2 describe-route-tables \
                            --filters Name=vpc-id,Values=$vpc \
                            --query 'RouteTables[].Associations[?Main==`false`].RouteTableAssociationId' \
@@ -153,29 +207,46 @@ jobs:
                            --filters Name=vpc-id,Values=$vpc \
                            --query 'RouteTables[?Associations[?Main==`false`]].RouteTableId' \
                            --output text || true); do
+              echo "• Deleting Route Table $rtb"
               aws ec2 delete-route-table --route-table-id "$rtb" || true
             done
 
-            # ── Subnets ────────────────────────────────────────────
+            # ── 2.6 Subnets (private & public) ────────────────────
             for subnet in $(aws ec2 describe-subnets \
                               --filters Name=vpc-id,Values=$vpc \
                               --query 'Subnets[].SubnetId' --output text || true); do
+              echo "• Deleting Subnet $subnet"
               aws ec2 delete-subnet --subnet-id "$subnet" || true
             done
 
-            # ── Security groups (non‑default) ─────────────────────
+            # ── 2.7 Security groups (non‑default) ─────────────────
             for sg in $(aws ec2 describe-security-groups \
                            --filters Name=vpc-id,Values=$vpc \
                            --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
                            --output text || true); do
+              echo "• Deleting Security Group $sg"
               aws ec2 delete-security-group --group-id "$sg" || true
             done
 
-            # ── Finally delete the VPC itself ─────────────────────
+            # ── 2.8 Stray ENIs (must be *available*) ───────────────
+            for eni in $(aws ec2 describe-network-interfaces \
+                           --filters Name=vpc-id,Values=$vpc Name=status,Values=available \
+                           --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                           --output text || true); do
+              echo "• Deleting ENI $eni"
+              aws ec2 delete-network-interface --network-interface-id "$eni" || true
+            done
+
+            # ── 2.9 Finally delete the VPC – then wait up to 2 min ─
+            echo "• Deleting VPC $vpc"
             aws ec2 delete-vpc --vpc-id "$vpc" || true
+            for t in {1..24}; do
+              aws ec2 describe-vpcs --vpc-ids "$vpc" >/dev/null 2>&1 || { echo "✔️  $vpc deleted"; break; }
+              sleep 5
+            done
+
             echo "::endgroup::"
           done
-
 ###############################################################################
 # 2)  DEPLOY – create / update the entire stack (Terraform apply)
 ###############################################################################
