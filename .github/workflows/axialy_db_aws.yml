@@ -4,21 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       db_identifier:
-        description: "AWS RDS instance identifier"
+        description: "AWS RDS instance identifier"
         required: true
         default: "axialy-database-cluster"
+
       aws_region:
-        description: "AWS region (e.g. us‑west‑1, us‑east‑1)"
+        description: "AWS region (e.g. us-west-1, us-east-1)"
         required: true
-        default: "us‑west‑1"
+        default: "us-west-1"
+
       instance_class:
         description: "RDS instance class"
         required: true
         default: "db.t3.micro"
+
       allocated_storage:
         description: "Allocated storage in GB"
         required: true
         default: "20"
+
       cleanup_on_exit:
         description: "Destroy everything after the run (true/false)"
         required: false
@@ -28,12 +32,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      AWS_ACCESS_KEY_ID:       ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY:   ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION:      ${{ github.event.inputs.aws_region }}
-      TF_VAR_suffix:            ${{ github.run_id }}
-      TF_VAR_prevent_destroy:  "false"
-      TF_VAR_deletion_protection: "false"
+      AWS_ACCESS_KEY_ID:            ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:        ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:           ${{ github.event.inputs.aws_region }}
+      TF_VAR_suffix:                ${{ github.run_id }}
+      TF_VAR_prevent_destroy:       "false"
+      TF_VAR_deletion_protection:   "false"
 
     steps:
       - name: Checkout code
@@ -66,9 +70,9 @@ jobs:
             -var="instance_class=${{ github.event.inputs.instance_class }}" \
             -var="allocated_storage=${{ github.event.inputs.allocated_storage }}"
 
-          echo "db_endpoint=$(terraform output -raw db_endpoint)"      >> "$GITHUB_OUTPUT"
-          echo "db_port=$(terraform output -raw db_port)"              >> "$GITHUB_OUTPUT"
-          echo "db_admin_user=$(terraform output -raw db_admin_user)"  >> "$GITHUB_OUTPUT"
+          echo "db_endpoint=$(terraform output -raw db_endpoint)"          >> "$GITHUB_OUTPUT"
+          echo "db_port=$(terraform output -raw db_port)"                  >> "$GITHUB_OUTPUT"
+          echo "db_admin_user=$(terraform output -raw db_admin_user)"      >> "$GITHUB_OUTPUT"
           echo "db_admin_password=$(terraform output -raw db_admin_password)" >> "$GITHUB_OUTPUT"
 
       - name: Wait for RDS instance to be available
@@ -94,7 +98,7 @@ jobs:
             mysql --host="$DB_HOST" --port="$DB_PORT" \
                   --user="$DB_USER" --password="$DB_PASS" \
                   --connect-timeout=30 -e "SELECT 1" && break || true
-            echo "Connection failed, retrying in 30 s ($i/5)…"
+            echo "Connection failed; retrying in 30 s ($i/5)…"
             sleep 30
           done
 
@@ -134,16 +138,15 @@ jobs:
     needs: deploy
     runs-on: ubuntu-latest
     env:
-      AWS_ACCESS_KEY_ID:       ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY:   ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION:      ${{ github.event.inputs.aws_region }}
-      TF_VAR_suffix:            ${{ github.run_id }}
-      TF_VAR_prevent_destroy:  "false"
-      TF_VAR_deletion_protection: "false"
+      AWS_ACCESS_KEY_ID:            ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:        ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:           ${{ github.event.inputs.aws_region }}
+      TF_VAR_suffix:                ${{ github.run_id }}
+      TF_VAR_prevent_destroy:       "false"
+      TF_VAR_deletion_protection:   "false"
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
