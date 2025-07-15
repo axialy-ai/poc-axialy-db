@@ -1,0 +1,97 @@
+name: Axialy DB
+
+on:
+  workflow_dispatch:
+    inputs:
+      db_instance_identifier:
+        description: "RDS instance identifier"
+        required: true
+      aws_region:
+        description: "AWS region"
+        default: us‑west‑2
+      db_instance_class:
+        description: "Instance class"
+        default: db.t3.micro
+      allocated_storage:
+        description: "Allocated storage (GiB)"
+        default: "20"
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ github.event.inputs.aws_region }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.6
+        terraform_wrapper: false
+
+    - name: Terraform init
+      working-directory: infra/database
+      run: terraform init -input=false
+
+    - name: Terraform apply
+      id: tfout
+      working-directory: infra/database
+      run: |
+        terraform apply -auto-approve -input=false \
+          -var="db_instance_identifier=${{ github.event.inputs.db_instance_identifier }}" \
+          -var="aws_region=${{ github.event.inputs.aws_region }}" \
+          -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" \
+          -var="allocated_storage=${{ github.event.inputs.allocated_storage }}"
+        echo "db_host=$(terraform output -raw db_host)" >> "$GITHUB_OUTPUT"
+        echo "db_port=$(terraform output -raw db_port)" >> "$GITHUB_OUTPUT"
+        echo "db_user=$(terraform output -raw db_user)" >> "$GITHUB_OUTPUT"
+        echo "db_pass=$(terraform output -raw db_pass)" >> "$GITHUB_OUTPUT"
+
+    - name: Load schemas
+      if: success()
+      env:
+        DB_HOST: ${{ steps.tfout.outputs.db_host }}
+        DB_PORT: ${{ steps.tfout.outputs.db_port }}
+        DB_USER: ${{ steps.tfout.outputs.db_user }}
+        DB_PASS: ${{ steps.tfout.outputs.db_pass }}
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y mysql-client
+        sleep 120
+        mysql --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" --password="$DB_PASS" -e "CREATE DATABASE IF NOT EXISTS axialy_admin CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        mysql --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" --password="$DB_PASS" -e "CREATE DATABASE IF NOT EXISTS axialy_ui CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        mysql --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" --password="$DB_PASS" axialy_admin < db/axialy_admin.sql
+        mysql --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" --password="$DB_PASS" axialy_ui < db/axialy_ui.sql
+
+    - name: Save secrets
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        if [ -z "$GH_TOKEN" ]; then exit 0; fi
+        gh secret set DB_HOST --body "${{ steps.tfout.outputs.db_host }}"
+        gh secret set DB_PORT --body "${{ steps.tfout.outputs.db_port }}"
+        gh secret set DB_USER --body "${{ steps.tfout.outputs.db_user }}"
+        gh secret set DB_PASSWORD --body "${{ steps.tfout.outputs.db_pass }}"
+
+    - name: Summary
+      run: |
+        echo "========================================"
+        echo "Database instance deployed and initialized"
+        echo "========================================"
+        echo "Instance: ${{ github.event.inputs.db_instance_identifier }}"
+        echo "Host    : ${{ steps.tfout.outputs.db_host }}"
+        echo "Port    : ${{ steps.tfout.outputs.db_port }}"
+        echo "User    : ${{ steps.tfout.outputs.db_user }}"
+        echo "========================================"
+        echo ""
+        echo "Next steps:"
+        echo "1. Run the 'Axialy Admin UI' workflow to deploy the application"
+        echo "2. Access the admin interface to complete initialization"
+        echo ""
+        echo "Database credentials have been saved as GitHub secrets"
+        echo "========================================"
