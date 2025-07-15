@@ -23,13 +23,13 @@ variable "allocated_storage" {
 }
 
 variable "multi_az" {
-  description = "Enable Multi-AZ deployment for high availability"
+  description = "Enable Multi-AZ deployment"
   type        = bool
   default     = false
 }
 
 variable "backup_retention_period" {
-  description = "Number of days to retain backups"
+  description = "Backup retention in days"
   type        = number
   default     = 7
 }
@@ -47,7 +47,7 @@ variable "maintenance_window" {
 }
 
 variable "vpc_cidr" {
-  description = "CIDR block for the VPC"
+  description = "CIDR block for VPC"
   type        = string
   default     = "10.0.0.0/16"
 }
@@ -65,50 +65,7 @@ variable "public_subnet_cidrs" {
 }
 
 variable "admin_default_user" {
-  description = "Default admin username from GitHub secrets"
+  description = "Admin username for the RDS instance"
   type        = string
   default     = "axialy_admin"
-}
-
-variable "admin_default_email" {
-  description = "Default admin email from GitHub secrets"
-  type        = string
-  default     = "admin@axialy.ai"
-}
-
-variable "smtp_host" {
-  description = "SMTP host for email notifications"
-  type        = string
-  default     = ""
-}
-
-variable "smtp_port" {
-  description = "SMTP port"
-  type        = number
-  default     = 587
-}
-
-variable "smtp_user" {
-  description = "SMTP username"
-  type        = string
-  default     = ""
-}
-
-variable "smtp_password" {
-  description = "SMTP password"
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "ec2_elastic_ip_allocation_id" {
-  description = "Elastic IP allocation ID for EC2 instances"
-  type        = string
-  default     = ""
-}
-
-variable "ec2_key_pair" {
-  description = "EC2 key pair name"
-  type        = string
-  default     = ""
 }
