@@ -1,0 +1,156 @@
+name: Axialy DB AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      db_identifier:
+        description: "AWS RDS instance identifier"
+        required: true
+        default: "axialy-database-cluster"
+      aws_region:
+        description: "AWS region (e.g. us-west-1, us-east-1)"
+        required: true
+        default: "us-west-1"
+      instance_class:
+        description: "RDS instance class"
+        required: true
+        default: "db.t3.micro"
+      allocated_storage:
+        description: "Allocated storage in GB"
+        required: true
+        default: "20"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ github.event.inputs.aws_region }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.aws_region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.6
+        terraform_wrapper: false
+
+    - name: Terraform init
+      working-directory: infra/database-aws
+      run: terraform init -input=false
+
+    - name: Terraform apply
+      id: tfout
+      working-directory: infra/database-aws
+      run: |
+        terraform apply -auto-approve -input=false \
+          -var="db_identifier=${{ github.event.inputs.db_identifier }}" \
+          -var="aws_region=${{ github.event.inputs.aws_region }}" \
+          -var="instance_class=${{ github.event.inputs.instance_class }}" \
+          -var="allocated_storage=${{ github.event.inputs.allocated_storage }}"
+
+        echo "db_endpoint=$(terraform output -raw db_endpoint)" >> "$GITHUB_OUTPUT"
+        echo "db_port=$(terraform output -raw db_port)" >> "$GITHUB_OUTPUT"
+        echo "db_admin_user=$(terraform output -raw db_admin_user)" >> "$GITHUB_OUTPUT"
+        echo "db_admin_password=$(terraform output -raw db_admin_password)" >> "$GITHUB_OUTPUT"
+
+    - name: Wait for RDS instance to be available
+      run: |
+        echo "Waiting for RDS instance to be available..."
+        aws rds wait db-instance-available \
+          --db-instance-identifier ${{ github.event.inputs.db_identifier }}
+        echo "RDS instance is now available"
+        sleep 30
+
+    - name: Load database schemas
+      if: success()
+      env:
+        DB_HOST: ${{ steps.tfout.outputs.db_endpoint }}
+        DB_PORT: ${{ steps.tfout.outputs.db_port }}
+        DB_USER: ${{ steps.tfout.outputs.db_admin_user }}
+        DB_PASS: ${{ steps.tfout.outputs.db_admin_password }}
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y mysql-client
+
+        echo "Testing database connectivity..."
+        max_retries=5
+        retry_count=0
+        
+        while [ $retry_count -lt $max_retries ]; do
+          if mysql --host="${DB_HOST}" --port="${DB_PORT}" \
+                --user="${DB_USER}" --password="${DB_PASS}" \
+                --connect-timeout=30 \
+                -e "SELECT 1"; then
+            echo "Database connection successful"
+            break
+          else
+            retry_count=$((retry_count + 1))
+            if [ $retry_count -lt $max_retries ]; then
+              echo "Connection failed, retrying in 30 seconds... (attempt $retry_count/$max_retries)"
+              sleep 30
+            else
+              echo "Failed to connect to database after $max_retries attempts"
+              exit 1
+            fi
+          fi
+        done
+
+        for db in axialy_admin axialy_ui; do
+          echo ">> Creating database $db"
+          mysql --host="${DB_HOST}" --port="${DB_PORT}" \
+                --user="${DB_USER}" --password="${DB_PASS}" \
+                -e "CREATE DATABASE IF NOT EXISTS ${db} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+          
+          echo ">> Importing schema into $db"
+          mysql --host="${DB_HOST}" --port="${DB_PORT}" \
+                --user="${DB_USER}" --password="${DB_PASS}" \
+                "${db}" < "db/${db}.sql"
+          echo "✓ Schema imported successfully into $db"
+        done
+        echo "✓ All databases created and schemas imported successfully."
+
+    - name: Save database credentials as repository secrets
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        if [ -z "$GH_TOKEN" ]; then
+          echo "::warning::GH_PAT secret not set. Cannot update repository secrets automatically."
+          exit 0
+        fi
+
+        gh secret set DB_HOST     --body "${{ steps.tfout.outputs.db_endpoint }}"
+        gh secret set DB_PORT     --body "${{ steps.tfout.outputs.db_port }}"
+        gh secret set DB_USER     --body "${{ steps.tfout.outputs.db_admin_user }}"
+        gh secret set DB_PASSWORD --body "${{ steps.tfout.outputs.db_admin_password }}"
+        echo "✓ Repository secrets updated."
+
+    - name: Display deployment summary
+      run: |
+        echo "========================================"
+        echo "AWS RDS Database deployed & initialized!"
+        echo "========================================"
+        echo "Instance: ${{ github.event.inputs.db_identifier }}"
+        echo "Region  : ${{ github.event.inputs.aws_region }}"
+        echo "Host    : ${{ steps.tfout.outputs.db_endpoint }}"
+        echo "Port    : ${{ steps.tfout.outputs.db_port }}"
+        echo "User    : ${{ steps.tfout.outputs.db_admin_user }}"
+        echo "========================================"
+        echo ""
+        echo "Next steps:"
+        echo "1. Run the 'Axialy Admin UI' workflow to deploy the application"
+        echo "2. Access the admin interface to complete initialization"
+        echo ""
+        echo "Note: Database credentials have been saved as GitHub secrets"
+        echo "========================================"
