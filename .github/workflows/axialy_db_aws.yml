@@ -8,9 +8,9 @@ on:
         required: true
         default: "axialy-database-cluster"
       aws_region:
-        description: "AWS region (e.g. us-west-1, us-east-1)"
+        description: "AWS region (e.g. us‑west‑1, us‑east‑1)"
         required: true
-        default: "us-west-1"
+        default: "us‑west‑1"
       instance_class:
         description: "RDS instance class"
         required: true
@@ -19,14 +19,22 @@ on:
         description: "Allocated storage in GB"
         required: true
         default: "20"
+      cleanup_on_exit:
+        description: "Destroy everything after the run (true/false)"
+        required: false
+        default: "true"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ github.event.inputs.aws_region }}
+      AWS_ACCESS_KEY_ID:       ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:   ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:      ${{ github.event.inputs.aws_region }}
+      # make every run’s resources unique & removable
+      TF_VAR_suffix:            ${{ github.run_id }}
+      TF_VAR_prevent_destroy:  "false"
+      TF_VAR_deletion_protection: "false"
 
     steps:
       - name: Checkout code
@@ -35,9 +43,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ github.event.inputs.aws_region }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -59,18 +67,18 @@ jobs:
             -var="instance_class=${{ github.event.inputs.instance_class }}" \
             -var="allocated_storage=${{ github.event.inputs.allocated_storage }}"
 
-          echo "db_endpoint=$(terraform output -raw db_endpoint)" >> "$GITHUB_OUTPUT"
-          echo "db_port=$(terraform output -raw db_port)" >> "$GITHUB_OUTPUT"
-          echo "db_admin_user=$(terraform output -raw db_admin_user)" >> "$GITHUB_OUTPUT"
+          echo "db_endpoint=$(terraform output -raw db_endpoint)"      >> "$GITHUB_OUTPUT"
+          echo "db_port=$(terraform output -raw db_port)"              >> "$GITHUB_OUTPUT"
+          echo "db_admin_user=$(terraform output -raw db_admin_user)"  >> "$GITHUB_OUTPUT"
           echo "db_admin_password=$(terraform output -raw db_admin_password)" >> "$GITHUB_OUTPUT"
 
       - name: Wait for RDS instance to be available
         run: |
-          echo "Waiting for RDS instance to be available..."
+          echo "Waiting for RDS instance to be available…"
           aws rds wait db-instance-available \
             --db-instance-identifier ${{ github.event.inputs.db_identifier }}
           echo "RDS instance is now available"
-          sleep 30
+          sleep 30   # give the endpoint a moment to accept connections
 
       - name: Load database schemas
         if: success()
@@ -83,17 +91,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y mysql-client
 
-          max_retries=5
-          retry_count=0
-          until mysql --host="$DB_HOST" --port="$DB_PORT" \
-                      --user="$DB_USER" --password="$DB_PASS" \
-                      --connect-timeout=30 -e "SELECT 1" || [ $retry_count -eq $max_retries ]
-          do
-            retry_count=$((retry_count + 1))
-            echo "Connection failed, retrying in 30 seconds... ($retry_count/$max_retries)"
+          for i in {1..5}; do
+            mysql --host="$DB_HOST" --port="$DB_PORT" \
+                  --user="$DB_USER" --password="$DB_PASS" \
+                  --connect-timeout=30 -e "SELECT 1" && break || true
+            echo "Connection failed, retrying in 30 s ($i/5)…"
             sleep 30
           done
-          [ $retry_count -eq $max_retries ] && exit 1
 
           for db in axialy_admin axialy_ui; do
             mysql --host="$DB_HOST" --port="$DB_PORT" \
@@ -125,3 +129,43 @@ jobs:
           echo "Port     : ${{ steps.tfout.outputs.db_port }}"
           echo "User     : ${{ steps.tfout.outputs.db_admin_user }}"
           echo "========================================"
+
+  cleanup:
+    if: ${{ always() && github.event.inputs.cleanup_on_exit == 'true' }}
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID:       ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:   ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:      ${{ github.event.inputs.aws_region }}
+      TF_VAR_suffix:            ${{ github.run_id }}
+      TF_VAR_prevent_destroy:  "false"
+      TF_VAR_deletion_protection: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: infra/database-aws
+        run: terraform init -input=false
+
+      - name: Terraform destroy (clean‑up)
+        working-directory: infra/database-aws
+        run: |
+          terraform destroy -auto-approve -input=false \
+            -var="db_identifier=${{ github.event.inputs.db_identifier }}" \
+            -var="aws_region=${{ github.event.inputs.aws_region }}" \
+            -var="instance_class=${{ github.event.inputs.instance_class }}" \
+            -var="allocated_storage=${{ github.event.inputs.allocated_storage }}"
+
