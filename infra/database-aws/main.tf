@@ -6,12 +6,21 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+locals {
+  uniq_suffix       = var.suffix != "" ? var.suffix : "default"
+  subnet_group_name = "axialy-db-subnet-group-${local.uniq_suffix}"
+  kms_alias_name    = "alias/axialy-rds-${local.uniq_suffix}"
+}
+
 resource "random_password" "db_password" {
   length           = 32
   special          = true
   override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
+# ------------------------------------------------------------------
+#                           NETWORKING
+# ------------------------------------------------------------------
 resource "aws_vpc" "axialy" {
   cidr_block           = var.vpc_cidr
   enable_dns_hostnames = true
@@ -141,6 +150,9 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private[count.index].id
 }
 
+# ------------------------------------------------------------------
+#                      SECURITY GROUP
+# ------------------------------------------------------------------
 resource "aws_security_group" "rds" {
   name_prefix = "axialy-rds-sg-"
   description = "Security group for Axialy RDS instance"
@@ -169,52 +181,35 @@ resource "aws_security_group" "rds" {
   }
 }
 
+# ------------------------------------------------------------------
+#                       DB SUBNET GROUP (unique)
+# ------------------------------------------------------------------
 resource "aws_db_subnet_group" "axialy" {
-  name       = "axialy-db-subnet-group"
+  name       = local.subnet_group_name
   subnet_ids = aws_subnet.private[*].id
 
   tags = {
-    Name        = "axialy-db-subnet-group"
+    Name        = local.subnet_group_name
     Project     = "Axialy AI Platform"
     Environment = "production"
     ManagedBy   = "terraform"
   }
 }
 
+# ------------------------------------------------------------------
+#                    PARAMETER GROUP
+# ------------------------------------------------------------------
 resource "aws_db_parameter_group" "axialy" {
   name_prefix = "axialy-mysql8-"
   family      = "mysql8.0"
   description = "Custom parameter group for Axialy MySQL 8.0"
 
-  parameter {
-    name  = "character_set_server"
-    value = "utf8mb4"
-  }
-
-  parameter {
-    name  = "collation_server"
-    value = "utf8mb4_unicode_ci"
-  }
-
-  parameter {
-    name  = "max_connections"
-    value = "200"
-  }
-
-  parameter {
-    name  = "innodb_buffer_pool_size"
-    value = "{DBInstanceClassMemory*3/4}"
-  }
-
-  parameter {
-    name  = "slow_query_log"
-    value = "1"
-  }
-
-  parameter {
-    name  = "long_query_time"
-    value = "2"
-  }
+  parameter { name = "character_set_server"      value = "utf8mb4" }
+  parameter { name = "collation_server"          value = "utf8mb4_unicode_ci" }
+  parameter { name = "max_connections"           value = "200" }
+  parameter { name = "innodb_buffer_pool_size"   value = "{DBInstanceClassMemory*3/4}" }
+  parameter { name = "slow_query_log"            value = "1" }
+  parameter { name = "long_query_time"           value = "2" }
 
   tags = {
     Name        = "axialy-db-parameter-group"
@@ -224,6 +219,9 @@ resource "aws_db_parameter_group" "axialy" {
   }
 }
 
+# ------------------------------------------------------------------
+#                             KMS
+# ------------------------------------------------------------------
 resource "aws_kms_key" "rds" {
   description             = "KMS key for Axialy RDS encryption"
   deletion_window_in_days = 10
@@ -238,37 +236,47 @@ resource "aws_kms_key" "rds" {
 }
 
 resource "aws_kms_alias" "rds" {
-  name          = "alias/axialy-rds"
+  name          = local.kms_alias_name
   target_key_id = aws_kms_key.rds.key_id
 }
 
+# ------------------------------------------------------------------
+#                         RDS INSTANCE
+# ------------------------------------------------------------------
 resource "aws_db_instance" "axialy" {
-  identifier             = var.db_identifier
-  engine                 = "mysql"
-  engine_version         = "8.0.35"
-  instance_class         = var.instance_class
-  allocated_storage      = var.allocated_storage
-  storage_type           = "gp3"
-  storage_encrypted      = true
-  kms_key_id             = aws_kms_key.rds.arn
-  db_name                = "axialy"
-  username               = var.admin_default_user
-  password               = random_password.db_password.result
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  db_subnet_group_name   = aws_db_subnet_group.axialy.name
-  parameter_group_name   = aws_db_parameter_group.axialy.name
-  multi_az               = var.multi_az
-  publicly_accessible    = false
-  backup_retention_period = var.backup_retention_period
-  backup_window          = var.backup_window
-  maintenance_window     = var.maintenance_window
+  identifier                    = var.db_identifier
+  engine                        = "mysql"
+  engine_version                = "8.0.35"
+  instance_class                = var.instance_class
+  allocated_storage             = var.allocated_storage
+  storage_type                  = "gp3"
+  storage_encrypted             = true
+  kms_key_id                    = aws_kms_key.rds.arn
+
+  db_name                       = "axialy"
+  username                      = var.admin_default_user
+  password                      = random_password.db_password.result
+
+  vpc_security_group_ids        = [aws_security_group.rds.id]
+  db_subnet_group_name          = aws_db_subnet_group.axialy.name
+  parameter_group_name          = aws_db_parameter_group.axialy.name
+
+  multi_az                      = var.multi_az
+  publicly_accessible           = false
+  backup_retention_period       = var.backup_retention_period
+  backup_window                 = var.backup_window
+  maintenance_window            = var.maintenance_window
+
   enabled_cloudwatch_logs_exports = ["error", "general", "slowquery"]
-  deletion_protection    = true
-  skip_final_snapshot    = false
-  final_snapshot_identifier = "${var.db_identifier}-final-snapshot-${formatdate("YYYY-MM-DD-hhmm", timestamp())}"
-  auto_minor_version_upgrade = true
-  apply_immediately          = false
-  performance_insights_enabled = true
+
+  deletion_protection           = var.deletion_protection
+  skip_final_snapshot           = false
+  final_snapshot_identifier     = "${var.db_identifier}-final-snapshot-${formatdate("YYYY-MM-DD-hhmm", timestamp())}"
+
+  auto_minor_version_upgrade    = true
+  apply_immediately             = false
+
+  performance_insights_enabled  = true
   performance_insights_retention_period = 7
 
   tags = {
@@ -279,10 +287,13 @@ resource "aws_db_instance" "axialy" {
   }
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = var.prevent_destroy
   }
 }
 
+# ------------------------------------------------------------------
+#              SSM PARAMETERS (host, port, user, password)
+# ------------------------------------------------------------------
 resource "aws_ssm_parameter" "db_host" {
   name  = "/axialy/database/host"
   type  = "String"
@@ -335,6 +346,9 @@ resource "aws_ssm_parameter" "db_password" {
   }
 }
 
+# ------------------------------------------------------------------
+#                CLOUDWATCH LOG GROUPS
+# ------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "rds_error" {
   name              = "/aws/rds/instance/${var.db_identifier}/error"
   retention_in_days = 30
@@ -371,6 +385,9 @@ resource "aws_cloudwatch_log_group" "rds_slowquery" {
   }
 }
 
+# ------------------------------------------------------------------
+#                       CLOUDWATCH ALARMS
+# ------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "database_cpu" {
   alarm_name          = "axialy-database-high-cpu"
   comparison_operator = "GreaterThanThreshold"
