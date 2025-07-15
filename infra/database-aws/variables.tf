@@ -69,3 +69,22 @@ variable "admin_default_user" {
   type        = string
   default     = "axialy_admin"
 }
+
+# ---------- NEW ----------
+variable "suffix" {
+  description = "Unique suffix for resource names (supplied by CI run id)"
+  type        = string
+  default     = "default"
+}
+
+variable "prevent_destroy" {
+  description = "Toggle lifecycle.prevent_destroy for the RDS instance"
+  type        = bool
+  default     = true
+}
+
+variable "deletion_protection" {
+  description = "Toggle RDS deletion protection flag"
+  type        = bool
+  default     = true
+}
