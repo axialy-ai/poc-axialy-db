@@ -1,5 +1,5 @@
 # ── .github/workflows/axialy_db_aws.yml ───────────────────────────────────────
-name: Axialy DB AWS
+name: Axialy DB AWS
 
 on:
   workflow_dispatch:
@@ -86,26 +86,25 @@ jobs:
           echo "tf_bucket=$BUCKET"          >> "$GITHUB_OUTPUT"
           echo "tf_lock_tbl=$LOCK_TABLE"    >> "$GITHUB_OUTPUT"
 
-      # ── Deep hygiene – bullet‑proof VPC purge & quota checks ──────
-      - name: Deep cleanup (orphan VPCs, NAT EIPs, ENIs, endpoints, KMS alias)
+      # ── Deep hygiene: VPC quota + orphan resources + alias cleanup ─
+      - name: Deep cleanup (Axialy VPCs & all descendants)
         shell: bash
         env:
           AWS_PAGER: ""
         run: |
           set -euo pipefail
 
-          ##################################################################
-          # 0) Quota sanity check
-          ##################################################################
+          ######################################################################
+          # 0) Quota sanity – raise the soft cap *and* clean‑up to stay under it
+          ######################################################################
           echo "🔎 Checking regional VPC quota utilisation …"
           SERVICE_CODE="vpc"
-          QUOTA_CODE="L-F678F1CE"   # "VPCs per Region"
+          QUOTA_CODE="L-F678F1CE"   # “VPCs per Region”
           CUR_VPCS=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
-          LIMIT_RAW=$(aws service-quotas get-service-quota \
-                        --service-code "$SERVICE_CODE" \
-                        --quota-code   "$QUOTA_CODE" \
-                        --query 'Quota.Value' --output text)
-          CUR_LIMIT=${LIMIT_RAW%%.*}
+          CUR_LIMIT=$(aws service-quotas get-service-quota \
+                         --service-code "$SERVICE_CODE" \
+                         --quota-code   "$QUOTA_CODE" \
+                         --query 'Quota.Value' --output text)
           echo "• Current usage: ${CUR_VPCS}/${CUR_LIMIT}"
 
           if [ "$CUR_VPCS" -ge "$CUR_LIMIT" ]; then
@@ -117,9 +116,9 @@ jobs:
                  --desired-value "$DESIRED" 2>/dev/null || true
           fi
 
-          ##################################################################
-          # 1) Remove stale KMS alias first
-          ##################################################################
+          ######################################################################
+          # 1) Wipe conflicting KMS alias (must happen *before* TF runs)
+          ######################################################################
           if aws kms list-aliases \
                --query 'Aliases[?AliasName==`alias/axialy-rds`]' \
                --output text | grep -q 'alias/axialy-rds'; then
@@ -127,9 +126,13 @@ jobs:
             aws kms delete-alias --alias-name alias/axialy-rds
           fi
 
-          ##################################################################
-          # 2) Purge every Axialy‑tagged VPC
-          ##################################################################
+          ######################################################################
+          # 2) Purge every VPC tagged Name=axialy-* (plus ALL children).  The
+          #    order strictly follows AWS dependency rules:
+          #      • RDS (instances & clusters)  ➜ DB subnet groups
+          #      • NAT GWs ➜ Endpoints ➜ ENIs ➜ IGWs ➜ NACLs ➜ RTs ➜ Subnets
+          #      • SGs (non‑default) ➜ final VPC deletion
+          ######################################################################
           orphan_vpcs=$(aws ec2 describe-vpcs \
                        --filters "Name=tag:Name,Values=axialy-*" \
                        --query 'Vpcs[].VpcId' --output text || true)
@@ -137,16 +140,61 @@ jobs:
           for vpc in $orphan_vpcs; do
             echo "::group::🧹 Full purge of $vpc"
 
-            # Helper – poll until a predicate is true or we time‑out
-            poll() {  # $1=cmd  $2=max_tries  $3=sleep_secs
-              for i in $(seq 1 "$2"); do
-                eval "$1" && return 0
-                sleep "$3"
-              done
-              return 1
-            }
+            # ────────────────────────────────────────────────────────
+            # 2.1  RDS (instances & clusters) referencing this VPC
+            #       ⤷ ensures subnet deletion won’t hit dependencies
+            # ────────────────────────────────────────────────────────
+            echo "🔻 Scanning for RDS resources inside $vpc"
+            # ---- Instances ---------------------------------------------------
+            for db in $(aws rds describe-db-instances \
+                          --query 'DBInstances[].DBInstanceIdentifier' \
+                          --output text); do
+              v=$(aws rds describe-db-instances \
+                     --db-instance-identifier "$db" \
+                     --query 'DBInstances[0].DBSubnetGroup.VpcId' --output text)
+              if [ "$v" = "$vpc" ]; then
+                echo "• Deleting RDS instance $db"
+                aws rds delete-db-instance \
+                     --db-instance-identifier "$db" \
+                     --skip-final-snapshot \
+                     --delete-automated-backups \
+                     --no-cli-pager
+                aws rds wait db-instance-deleted \
+                     --db-instance-identifier "$db"
+              fi
+            done
+            # ---- Clusters ----------------------------------------------------
+            for cluster in $(aws rds describe-db-clusters \
+                               --query 'DBClusters[].DBClusterIdentifier' \
+                               --output text); do
+              sg_name=$(aws rds describe-db-clusters \
+                          --db-cluster-identifier "$cluster" \
+                          --query 'DBClusters[0].DBSubnetGroup' --output text)
+              v=$(aws rds describe-db-subnet-groups \
+                     --db-subnet-group-name "$sg_name" \
+                     --query 'DBSubnetGroups[0].VpcId' --output text)
+              if [ "$v" = "$vpc" ]; then
+                echo "• Deleting RDS cluster $cluster"
+                aws rds delete-db-cluster \
+                     --db-cluster-identifier "$cluster" \
+                     --skip-final-snapshot \
+                     --no-cli-pager
+                aws rds wait db-cluster-deleted \
+                     --db-cluster-identifier "$cluster"
+              fi
+            done
+            # ---- Subnet‑groups (now orphaned) --------------------------------
+            for sg in $(aws rds describe-db-subnet-groups \
+                           --query 'DBSubnetGroups[?VpcId==`'"$vpc"'`].DBSubnetGroupName' \
+                           --output text); do
+              echo "• Deleting DB subnet group $sg"
+              aws rds delete-db-subnet-group \
+                   --db-subnet-group-name "$sg" || true
+            done
 
-            # ── 2.1 NAT Gateways & their EIPs (+ ENI wait) ────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.2  NAT Gateways  ➜ release EIPs (after state=deleted)
+            # ────────────────────────────────────────────────────────
             for ngw in $(aws ec2 describe-nat-gateways \
                            --filter Name=vpc-id,Values=$vpc \
                            --query 'NatGateways[].NatGatewayId' \
@@ -156,39 +204,31 @@ jobs:
                        --query 'NatGateways[0].NatGatewayAddresses[0].AllocationId' \
                        --output text || true)
               aws ec2 delete-nat-gateway --nat-gateway-id "$ngw" || true
-
-              # Wait up to 15 min for the gateway to disappear
-              poll "[[ \$(aws ec2 describe-nat-gateways --nat-gateway-ids $ngw \
-                       --query 'NatGateways[0].State' --output text 2>/dev/null || echo deleted) == deleted ]]" \
-                   90 10 || echo '  ⚠️  NAT GW still present after 15 min'
-
-              # ENIs created by the NAT GW
-              gw_enis=$(aws ec2 describe-network-interfaces \
-                          --filters Name=attachment.resource-id,Values=$ngw \
-                          --query 'NetworkInterfaces[].NetworkInterfaceId' \
-                          --output text || true)
-              if [ -n "$gw_enis" ] && [ "$gw_enis" != "None" ]; then
-                echo "  ↪ waiting on ENI(s) $gw_enis"
-                poll "! aws ec2 describe-network-interfaces --network-interface-ids $gw_enis >/dev/null 2>&1" \
-                     60 10 || echo '  ⚠️  ENIs still present after 10 min'
-              fi
-
-              [ -n "${alloc:-}" ] && [ "$alloc" != "None" ] \
-                && aws ec2 release-address --allocation-id "$alloc" 2>/dev/null || true
+              aws ec2 wait nat-gateway-deleted --nat-gateway-ids "$ngw" || true
+              [ -n "$alloc" ] && aws ec2 release-address --allocation-id "$alloc" || true
             done
 
-            # ── 2.2 VPC interface‑endpoints ──────────────────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.3  VPC Endpoints  ➜ wait until state = deleted
+            # ────────────────────────────────────────────────────────
             for vpce in $(aws ec2 describe-vpc-endpoints \
                             --filters Name=vpc-id,Values=$vpc \
                             --query 'VpcEndpoints[].VpcEndpointId' \
                             --output text || true); do
               echo "• Deleting VPC Endpoint $vpce"
               aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "$vpce" || true
-              poll "! aws ec2 describe-vpc-endpoints --vpc-endpoint-ids $vpce >/dev/null 2>&1" \
-                   90 10 || echo '  ⚠️  VPCE still present after 15 min'
+              for _ in {1..60}; do
+                state=$(aws ec2 describe-vpc-endpoints \
+                           --vpc-endpoint-ids "$vpce" \
+                           --query 'VpcEndpoints[0].State' --output text 2>/dev/null || echo deleted)
+                [ "$state" = "deleted" ] && break
+                sleep 5
+              done
             done
 
-            # ── 2.3 Detach & delete IGWs ─────────────────────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.4  Detach & delete IGWs
+            # ────────────────────────────────────────────────────────
             for igw in $(aws ec2 describe-internet-gateways \
                            --filters Name=attachment.vpc-id,Values=$vpc \
                            --query 'InternetGateways[].InternetGatewayId' \
@@ -196,10 +236,12 @@ jobs:
               echo "• Deleting IGW $igw"
               aws ec2 detach-internet-gateway --internet-gateway-id "$igw" \
                                               --vpc-id "$vpc" || true
-              aws ec2 delete-internet-gateway --internet-gateway-id "$igw" || true
+              aws ec2 delete-internet-gateway  --internet-gateway-id "$igw" || true
             done
 
-            # ── 2.4 Custom NACLs ─────────────────────────────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.5  Custom NACLs
+            # ────────────────────────────────────────────────────────
             for nacl in $(aws ec2 describe-network-acls \
                             --filters Name=vpc-id,Values=$vpc \
                             --query 'NetworkAcls[?IsDefault==`false`].NetworkAclId' \
@@ -208,7 +250,9 @@ jobs:
               aws ec2 delete-network-acl --network-acl-id "$nacl" || true
             done
 
-            # ── 2.5 Route‑tables (non‑main) ─────────────────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.6  Route‑tables & associations (non‑main)
+            # ────────────────────────────────────────────────────────
             for rta in $(aws ec2 describe-route-tables \
                            --filters Name=vpc-id,Values=$vpc \
                            --query 'RouteTables[].Associations[?Main==`false`].RouteTableAssociationId' \
@@ -223,7 +267,9 @@ jobs:
               aws ec2 delete-route-table --route-table-id "$rtb" || true
             done
 
-            # ── 2.6 Subnets ─────────────────────────────────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.7  Subnets
+            # ────────────────────────────────────────────────────────
             for subnet in $(aws ec2 describe-subnets \
                               --filters Name=vpc-id,Values=$vpc \
                               --query 'Subnets[].SubnetId' --output text || true); do
@@ -231,7 +277,9 @@ jobs:
               aws ec2 delete-subnet --subnet-id "$subnet" || true
             done
 
-            # ── 2.7 Non‑default Security Groups ─────────────────────────
+            # ────────────────────────────────────────────────────────
+            # 2.8  Security groups (non‑default)
+            # ────────────────────────────────────────────────────────
             for sg in $(aws ec2 describe-security-groups \
                            --filters Name=vpc-id,Values=$vpc \
                            --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
@@ -240,20 +288,28 @@ jobs:
               aws ec2 delete-security-group --group-id "$sg" || true
             done
 
-            # ── 2.8 Wait until **all** ENIs in the VPC are gone ─────────
-            echo "• Waiting for ENIs to drain"
-            poll "[[ \$(aws ec2 describe-network-interfaces \
-                     --filters Name=vpc-id,Values=$vpc \
-                     --query 'length(NetworkInterfaces)' --output text) == 0 ]]" \
-                 60 10 || echo '  ⚠️  ENIs still present after 10 min'
+            # ────────────────────────────────────────────────────────
+            # 2.9  Stray ENIs (must be *available*)
+            # ────────────────────────────────────────────────────────
+            for eni in $(aws ec2 describe-network-interfaces \
+                           --filters Name=vpc-id,Values=$vpc Name=status,Values=available \
+                           --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                           --output text || true); do
+              echo "• Deleting ENI $eni"
+              aws ec2 delete-network-interface --network-interface-id "$eni" || true
+            done
 
-            # ── 2.9 Delete the VPC – retry for up to 10 min ─────────────
+            # ────────────────────────────────────────────────────────
+            # 2.10 Final VPC delete + retry loop (up to 12× 5 s = 1 min)
+            # ────────────────────────────────────────────────────────
             echo "• Deleting VPC $vpc"
-            for try in $(seq 1 30); do
+            for try in {1..12}; do
               if aws ec2 delete-vpc --vpc-id "$vpc" 2>/dev/null; then
-                echo "✔️  $vpc deleted"; break
+                echo "✔️  $vpc deleted"
+                break
               fi
-              echo "  ↪ dependency still present – retry $try/30"; sleep 20
+              echo "    ↪ dependency still present – retry ${try}/12"
+              sleep 5
             done
 
             echo "::endgroup::"
