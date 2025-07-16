@@ -95,8 +95,7 @@ jobs:
           set -euo pipefail
 
           ##################################################################
-          # 0) Quota sanity check – request a bump *and* make sure we end up
-          #    below the current soft‑limit before Terraform runs.
+          # 0) Quota sanity check
           ##################################################################
           echo "🔎 Checking regional VPC quota utilisation …"
           SERVICE_CODE="vpc"
@@ -106,7 +105,7 @@ jobs:
                         --service-code "$SERVICE_CODE" \
                         --quota-code   "$QUOTA_CODE" \
                         --query 'Quota.Value' --output text)
-          CUR_LIMIT=${LIMIT_RAW%%.*}   # "5.0" → "5" ; leaves "5" untouched
+          CUR_LIMIT=${LIMIT_RAW%%.*}
           echo "• Current usage: ${CUR_VPCS}/${CUR_LIMIT}"
 
           if [ "$CUR_VPCS" -ge "$CUR_LIMIT" ]; then
@@ -119,7 +118,7 @@ jobs:
           fi
 
           ##################################################################
-          # 1) Remove stale KMS alias up‑front so Terraform can recreate it
+          # 1) Remove stale KMS alias first
           ##################################################################
           if aws kms list-aliases \
                --query 'Aliases[?AliasName==`alias/axialy-rds`]' \
@@ -129,7 +128,7 @@ jobs:
           fi
 
           ##################################################################
-          # 2) Purge every Axialy‑tagged VPC and **wait** for *all* children
+          # 2) Purge every Axialy‑tagged VPC
           ##################################################################
           orphan_vpcs=$(aws ec2 describe-vpcs \
                        --filters "Name=tag:Name,Values=axialy-*" \
@@ -138,7 +137,16 @@ jobs:
           for vpc in $orphan_vpcs; do
             echo "::group::🧹 Full purge of $vpc"
 
-            # ── 2.1 NAT Gateways & their EIPs (+ ENIs wait) ───────────────
+            # Helper – poll until a predicate is true or we time‑out
+            poll() {  # $1=cmd  $2=max_tries  $3=sleep_secs
+              for i in $(seq 1 "$2"); do
+                eval "$1" && return 0
+                sleep "$3"
+              done
+              return 1
+            }
+
+            # ── 2.1 NAT Gateways & their EIPs (+ ENI wait) ────────────────
             for ngw in $(aws ec2 describe-nat-gateways \
                            --filter Name=vpc-id,Values=$vpc \
                            --query 'NatGateways[].NatGatewayId' \
@@ -149,41 +157,35 @@ jobs:
                        --output text || true)
               aws ec2 delete-nat-gateway --nat-gateway-id "$ngw" || true
 
-              # Wait for the gateway itself to show 'deleted'
-              for _ in {1..60}; do
-                state=$(aws ec2 describe-nat-gateways --nat-gateway-ids "$ngw" \
-                         --query 'NatGateways[0].State' --output text 2>/dev/null || true)
-                [[ "$state" == "deleted" || "$state" == "None" ]] && break
-                sleep 5
-              done
+              # Wait up to 15 min for the gateway to disappear
+              poll "[[ \$(aws ec2 describe-nat-gateways --nat-gateway-ids $ngw \
+                       --query 'NatGateways[0].State' --output text 2>/dev/null || echo deleted) == deleted ]]" \
+                   90 10 || echo '  ⚠️  NAT GW still present after 15 min'
 
-              # Wait for residual ENIs created by the NAT‑GW to vanish
+              # ENIs created by the NAT GW
               gw_enis=$(aws ec2 describe-network-interfaces \
-                           --filters Name=attachment.nat-gateway-id,Values=$ngw \
-                           --query 'NetworkInterfaces[].NetworkInterfaceId' \
-                           --output text || true)
+                          --filters Name=attachment.resource-id,Values=$ngw \
+                          --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                          --output text || true)
               if [ -n "$gw_enis" ] && [ "$gw_enis" != "None" ]; then
-                echo "  ↪ waiting on ENIs $gw_enis"
-                aws ec2 wait network-interface-deleted --network-interface-ids $gw_enis || true
+                echo "  ↪ waiting on ENI(s) $gw_enis"
+                poll "! aws ec2 describe-network-interfaces --network-interface-ids $gw_enis >/dev/null 2>&1" \
+                     60 10 || echo '  ⚠️  ENIs still present after 10 min'
               fi
 
-              [ -n "${alloc:-}" ] && aws ec2 release-address --allocation-id "$alloc" 2>/dev/null || true
+              [ -n "${alloc:-}" ] && [ "$alloc" != "None" ] \
+                && aws ec2 release-address --allocation-id "$alloc" 2>/dev/null || true
             done
 
-            # ── 2.2 VPC interface‑endpoints & wait loop ───────────────────
+            # ── 2.2 VPC interface‑endpoints ──────────────────────────────
             for vpce in $(aws ec2 describe-vpc-endpoints \
                             --filters Name=vpc-id,Values=$vpc \
                             --query 'VpcEndpoints[].VpcEndpointId' \
                             --output text || true); do
               echo "• Deleting VPC Endpoint $vpce"
               aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "$vpce" || true
-
-              # manual waiter (CLI lacks vpc-endpoint-deleted)
-              for _ in {1..60}; do
-                aws ec2 describe-vpc-endpoints --vpc-endpoint-ids "$vpce" >/dev/null 2>&1 \
-                  || { echo "  ↪ $vpce gone"; break; }
-                sleep 5
-              done
+              poll "! aws ec2 describe-vpc-endpoints --vpc-endpoint-ids $vpce >/dev/null 2>&1" \
+                   90 10 || echo '  ⚠️  VPCE still present after 15 min'
             done
 
             # ── 2.3 Detach & delete IGWs ─────────────────────────────────
@@ -194,7 +196,7 @@ jobs:
               echo "• Deleting IGW $igw"
               aws ec2 detach-internet-gateway --internet-gateway-id "$igw" \
                                               --vpc-id "$vpc" || true
-              aws ec2 delete-internet-gateway  --internet-gateway-id "$igw" || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$igw" || true
             done
 
             # ── 2.4 Custom NACLs ─────────────────────────────────────────
@@ -206,7 +208,7 @@ jobs:
               aws ec2 delete-network-acl --network-acl-id "$nacl" || true
             done
 
-            # ── 2.5 Subnet route‑table associations & tables ─────────────
+            # ── 2.5 Route‑tables (non‑main) ─────────────────────────────
             for rta in $(aws ec2 describe-route-tables \
                            --filters Name=vpc-id,Values=$vpc \
                            --query 'RouteTables[].Associations[?Main==`false`].RouteTableAssociationId' \
@@ -238,29 +240,20 @@ jobs:
               aws ec2 delete-security-group --group-id "$sg" || true
             done
 
-            # ── 2.8 Any remaining *available* ENIs ──────────────────────
-            for eni in $(aws ec2 describe-network-interfaces \
-                           --filters Name=vpc-id,Values=$vpc Name=status,Values=available \
-                           --query 'NetworkInterfaces[].NetworkInterfaceId' \
-                           --output text || true); do
-              echo "• Deleting ENI $eni"
-              aws ec2 delete-network-interface --network-interface-id "$eni" || true
-            done
+            # ── 2.8 Wait until **all** ENIs in the VPC are gone ─────────
+            echo "• Waiting for ENIs to drain"
+            poll "[[ \$(aws ec2 describe-network-interfaces \
+                     --filters Name=vpc-id,Values=$vpc \
+                     --query 'length(NetworkInterfaces)' --output text) == 0 ]]" \
+                 60 10 || echo '  ⚠️  ENIs still present after 10 min'
 
-            # Wait until ENI count is zero (defensive)
-            for _ in {1..24}; do
-              residual=$(aws ec2 describe-network-interfaces \
-                           --filters Name=vpc-id,Values=$vpc \
-                           --query 'length(NetworkInterfaces)' --output text)
-              [ "$residual" -eq 0 ] && break
-              echo "  ↪ $residual ENI(s) still present … waiting"; sleep 5
-            done
-
-            # ── 2.9 Delete the VPC with retry guard ────────────────────
+            # ── 2.9 Delete the VPC – retry for up to 10 min ─────────────
             echo "• Deleting VPC $vpc"
-            for try in {1..12}; do
-              aws ec2 delete-vpc --vpc-id "$vpc" && { echo "✔️  $vpc deleted"; break; }
-              echo "  ↪ dependency still present – retry $try/12"; sleep 10
+            for try in $(seq 1 30); do
+              if aws ec2 delete-vpc --vpc-id "$vpc" 2>/dev/null; then
+                echo "✔️  $vpc deleted"; break
+              fi
+              echo "  ↪ dependency still present – retry $try/30"; sleep 20
             done
 
             echo "::endgroup::"
